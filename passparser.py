@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python
 
 import sys
 import json
@@ -17,6 +17,10 @@ class User:
 
     def calculate_user_likeliness(self):
         likeliness = 0
+
+        if self.username == "root" and self.uid == 0 and self.gid == 0:
+            return -1
+
         if self.uid >= 1000:
             likeliness += 1
         if self.gid >= 1000:
@@ -33,7 +37,10 @@ class User:
         ]:
             likeliness += 2
         elif "nologic" in self.shell_dir or "false" in self.shell_dir:
-            likeliness -= 2
+            if likeliness >= 2:
+                likeliness -= 2
+            else:
+                likeliness = 0
 
         return likeliness
 
@@ -56,10 +63,17 @@ def print_user_info(user):
     print_kv("Username:", user.username)
     print_kv("UID:", user.uid)
     print_kv("GID:", user.gid)
-    print_kv("Full Account Name:", user.full_name)
+
+    if user.full_name:
+        print_kv("Full Account Name:", user.full_name)
+
     print_kv("Home:", user.home_dir)
     print_kv("Shell:", user.shell_dir)
-    print_kv("User Likeliness:", user.likeliness)
+
+    if user.likeliness == -1:
+        print_kv("User Likeliness: ", "ROOT")
+    else:
+        print_kv("User Likeliness:", user.likeliness)
 
     if user.hash_marker == "x":
         print_kv("Password Hash:", "Stored in /etc/shadow")
@@ -72,6 +86,8 @@ def print_user_info(user):
         print("\nThis account is very likely to be a real user's.")
     elif user.likeliness >= 2:
         print("\nThis account might be a real user's.")
+    elif user.likeliness == -1:
+        print("\nThis is likely to be a root account.")
     else:
         print("\nThis account is likely a service account.")
 
@@ -80,7 +96,7 @@ def filter_func(argv, filter_index):
     if filter_index == len(argv) - 1:
         sys.exit("Please provide a filter.")
     filter_type = argv[filter_index + 1]
-    if filter_type == "user" or filter_type == "service":
+    if filter_type == "user" or filter_type == "service" or filter_type == "root":
         FILTER = filter_type
     elif filter_type is None:
         sys.exit("Please provide a filter.")
@@ -99,15 +115,69 @@ def handle_output(argv, output_index):
     return argv[output_index + 1], argv[output_index + 2]
 
 
+def print_help():
+    print(f"Default syntax: {sys.argv[0]} [arguments]")
+    print(" ")
+    print("Arguments:")
+    print("-h / --help: Shows this message")
+    print("-f / --filter (user / service / root): Filters for different account types")
+    print(
+        "-o / --output (list, json) [file name]: Output the findings to a JSON or a text file"
+    )
+    print("-u / --username [name]: Print the data of a specific user")
+    print(
+        "-p / --path [path]: Specify the path to the passwd file. Default: /etc/passwd"
+    )
+    print(
+        "-t / --threshold (0-6): Specify the likeliness from which an account counts as a user account"
+    )
+    print(
+        "--force-output: Output user information even if an output file is specified."
+    )
+
+
 def main():
     FILTER = None
     OUTPUT_REQUESTED = False
-    userfile = open_file()
+    USER_FILTER = None
+    userfile = None
     output_option = None
     filename = None
     output_index = None
+    output_file = None
+    threshold = 3
+    path = "/etc/passwd"
+    user_found = False
+
+    if len(sys.argv) == 2 and (sys.argv[1] == "-h" or sys.argv[1] == "--help"):
+        print_help()
+        sys.exit(0)
 
     if len(sys.argv) >= 2:
+        path_index = None
+        if "-p" in sys.argv or "--path" in sys.argv:
+            path_index = (
+                sys.argv.index("-p") if "-p" in sys.argv else sys.argv.index("--path")
+            )
+            path = (
+                sys.argv[path_index + 1]
+                if len(sys.argv) >= path_index + 2
+                else "/etc/passwd"
+            )
+
+        if "--force-output" in sys.argv:
+            OUTPUT_REQUESTED = True
+
+        if "-u" in sys.argv or "--username" in sys.argv:
+            user_index = (
+                sys.argv.index("-u")
+                if "-u" in sys.argv
+                else sys.argv.index("--username")
+            )
+            USER_FILTER = (
+                sys.argv[user_index + 1] if len(sys.argv) >= user_index + 2 else None
+            )
+
         filter_index = None
         if "-f" in sys.argv:
             filter_index = sys.argv.index("-f")
@@ -116,6 +186,19 @@ def main():
 
         if filter_index:
             FILTER = filter_func(sys.argv, filter_index)
+
+        if "-t" in sys.argv or "--threshold" in sys.argv:
+            threshold_index = (
+                sys.argv.index("-t")
+                if "-t" in sys.argv
+                else sys.argv.index("--threshold")
+            )
+
+            threshold = (
+                int(sys.argv[threshold_index + 1])
+                if len(sys.argv) >= threshold_index + 2
+                else 3
+            )
 
         if "-o" in sys.argv or "--output" in sys.argv:
             output_index = (
@@ -132,6 +215,8 @@ def main():
             except FileExistsError:
                 output_file = open(filename, "a")
 
+    userfile = open(path, "r")
+
     for line in userfile:
         fields = line.strip().split(":")
 
@@ -142,27 +227,38 @@ def main():
         user_likeliness = user.likeliness
 
         if (
-            (FILTER == "user" and user_likeliness >= 3)
-            or (FILTER == "service" and user_likeliness <= 3)
+            (FILTER == "root" and user_likeliness == -1)
+            or (FILTER == "user" and user_likeliness >= threshold)
+            or (FILTER == "service" and 0 <= user_likeliness <= threshold)
             or FILTER is None
         ):
-            if (output_option and OUTPUT_REQUESTED is True) or not output_option:
-                print_user_info(user)
-            if output_option == "list":
-                output_file.write(f"{user.username}\n")
-            elif output_option == "json":
-                user_dict = {
-                    "username": user.username,
-                    "uid": user.uid,
-                    "gid": user.gid,
-                    "full_name": user.full_name,
-                    "home_dir": user.home_dir,
-                    "shell_dir": user.shell_dir,
-                    "hash_marker": user.hash_marker,
-                    "user_likeliness": user.likeliness,
-                }
-                json_object = json.dumps(user_dict, indent=4)
-                output_file.write(f"{json_object}\n")
+            if USER_FILTER is None or user.username == USER_FILTER:
+                if (output_option and OUTPUT_REQUESTED is True) or not output_option:
+                    print_user_info(user)
+                if output_option == "list":
+                    output_file.write(f"{user.username}\n")
+                elif output_option == "json":
+                    user_dict = {
+                        "username": user.username,
+                        "uid": user.uid,
+                        "gid": user.gid,
+                        "full_name": user.full_name,
+                        "home_dir": user.home_dir,
+                        "shell_dir": user.shell_dir,
+                        "hash_marker": user.hash_marker,
+                        "user_likeliness": user.likeliness,
+                    }
+                    json_object = json.dumps(user_dict, indent=4)
+                    output_file.write(f"{json_object}\n")
+                user_found = True
+
+    if not user_found:
+        print("User not found.")
+
+    if userfile is not None:
+        userfile.close()
+    if output_file is not None:
+        output_file.close()
 
 
 if __name__ == "__main__":
